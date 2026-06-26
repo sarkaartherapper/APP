@@ -15,8 +15,11 @@ import PlaceholderPage from '../components/pages/PlaceholderPage';
 import AnalyticsPage from '../components/pages/AnalyticsPage';
 import UsagePage from '../components/pages/UsagePage';
 import DangerPage from '../components/pages/DangerPage';
+import MembersPage from '../components/pages/MembersPage';
+import RolesPage from '../components/pages/RolesPage';
+import InvitesPage from '../components/pages/InvitesPage';
 
-const PLACEHOLDER_PAGES = new Set(['members', 'roles', 'invites', 'invoices', 'general', 'endpoint', 'security', 'audit', 'docs']);
+const PLACEHOLDER_PAGES = new Set(['invoices', 'general', 'endpoint', 'security', 'audit', 'docs']);
 
 
 function AccountSidebar({ page, navigate, onBack }) {
@@ -57,6 +60,9 @@ const PAGES = {
   analytics: AnalyticsPage,
   usage: UsagePage,
   danger: DangerPage,
+  members: MembersPage,
+  roles: RolesPage,
+  invites: InvitesPage,
 };
 
 export default function ConsoleShell({ go, page, projectSlug, accountMode = false }) {

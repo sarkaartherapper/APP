@@ -34,6 +34,13 @@ export default function useConsoleRouteState() {
       return;
     }
 
+    if (window.location.pathname.startsWith('/invite/')) {
+      const token = decodeURIComponent(window.location.pathname.split('/').filter(Boolean)[1] || '');
+      try { sessionStorage.setItem('lethem_pending_invite_token', token); } catch (_) {}
+      window.history.replaceState({}, '', '/console');
+      return parsePath();
+    }
+
     setPublicPage('');
     if (window.location.pathname === '/health') {
       setIsPublicHealth(true);
