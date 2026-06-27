@@ -105,10 +105,13 @@ export default function LethemProvider({ children, projectSlug, page }) {
     let token = '';
     try { token = sessionStorage.getItem('lethem_pending_invite_token') || ''; } catch (_) {}
     if (!token) return null;
-    const res = await api('/api/invites/accept', { method: 'POST', body: { token } });
-    try { sessionStorage.removeItem('lethem_pending_invite_token'); } catch (_) {}
-    notify('Invite accepted');
-    return res;
+    try {
+      const res = await api('/api/invites/accept', { method: 'POST', body: { token } });
+      notify('Invite accepted');
+      return res;
+    } finally {
+      try { sessionStorage.removeItem('lethem_pending_invite_token'); } catch (_) {}
+    }
   };
 
   const loadProjects = async () => {
@@ -184,10 +187,19 @@ export default function LethemProvider({ children, projectSlug, page }) {
     finally { setTeamLoading(false); }
   };
 
+  const checkInvitee = async (email) => api('/api/invites/check', { method: 'POST', body: { email } });
+
   const inviteMember = async (email, role) => {
     const res = await api('/api/invites', { method: 'POST', body: { email, role } });
-    notify('Invite sent');
+    notify(res.user_exists ? 'In-app invite sent' : 'Email invite sent');
     await Promise.all([loadMembers().catch(() => []), loadInvites().catch(() => [])]);
+    return res;
+  };
+
+  const acceptInvite = async (inviteId) => {
+    const res = await api('/api/invites/accept', { method: 'POST', body: { inviteId } });
+    notify('Invite accepted');
+    await Promise.all([loadProjects().catch(() => []), loadInvites().catch(() => [])]);
     return res;
   };
 
@@ -286,7 +298,7 @@ export default function LethemProvider({ children, projectSlug, page }) {
     API, providers, loadProviders, fmtNum, fmtTime, fmtDate, quotaColor, sleep,
     api, notify, copyText, modal, setModal, revealedToken, setRevealedToken,
     loadMasterKeys, loadSubkeys, loadLogs, loadOverview, loadBilling, loadMembers, loadInvites,
-    inviteMember, updateMemberRole, removeMember, revokeInvite,
+    checkInvitee, inviteMember, acceptInvite, updateMemberRole, removeMember, revokeInvite,
     subkeys, setSubkeys, masterKeys, logs, analytics, billing, setBilling, members, invites, teamLoading, page, loading, copiedItem,
     selectedProject: projects.find((p) => p.slug === projectSlug || p.id === projectSlug),
   }), [modal, subkeys, masterKeys, logs, analytics, billing, members, invites, teamLoading, revealedToken, page, projectSlug, providers, loading, copiedItem, isAuthenticated, user?.sub, projects]);

@@ -5,14 +5,28 @@ export default function MembersPage({ ctx }) {
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('developer');
   const [busy, setBusy] = useState('');
+  const [inviteCheck, setInviteCheck] = useState(null);
 
   useEffect(() => { ctx.loadMembers?.().catch((e) => ctx.notify(e.message, 'error')); }, []);
 
-  const invite = async () => {
+  const resetInviteCheck = () => setInviteCheck(null);
+
+  const sendInvite = async (targetEmail = email, targetRole = role) => {
     setBusy('invite');
     try {
-      await ctx.inviteMember(email, role);
-      setEmail(''); setRole('developer');
+      await ctx.inviteMember(targetEmail, targetRole);
+      setEmail(''); setRole('developer'); resetInviteCheck();
+    } catch (e) { ctx.notify(e.message, 'error'); }
+    finally { setBusy(''); }
+  };
+
+  const invite = async () => {
+    setBusy('check'); resetInviteCheck();
+    try {
+      const check = await ctx.checkInvitee(email);
+      if (check.already_member) { ctx.notify('That user is already a member of this workspace.', 'error'); return; }
+      if (!check.exists) { setInviteCheck(check); return; }
+      await sendInvite(email, role);
     } catch (e) { ctx.notify(e.message, 'error'); }
     finally { setBusy(''); }
   };
@@ -36,15 +50,21 @@ export default function MembersPage({ ctx }) {
     <section className='page active team-page'>
       <div className='page-header'>
         <h1 className='page-title'>Team Members</h1>
-        <p className='page-sub'>Manage teammates on Lethem and send invites when someone is not already in your workspace.</p>
+        <p className='page-sub'>Check whether a teammate is already on Lethem, then send an in-app invite or email invite.</p>
       </div>
       <div className='card invite-card'>
-        <div className='card-header'><div><div className='card-title'>Invite a teammate</div><div className='card-sub'>If the user is not on Lethem, send them a transactional email invitation.</div></div></div>
+        <div className='card-header'><div><div className='card-title'>Invite a teammate</div><div className='card-sub'>Existing Lethem users receive an in-app invite. New users get an email invite link.</div></div></div>
         <div className='invite-form'>
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder='teammate@example.com' type='email' />
+          <input value={email} onChange={(e) => { setEmail(e.target.value); resetInviteCheck(); }} placeholder='teammate@example.com' type='email' />
           <select value={role} onChange={(e) => setRole(e.target.value)}>{ASSIGNABLE_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}</select>
-          <button className='btn btn-primary' disabled={busy === 'invite' || !email} onClick={invite}>{busy === 'invite' ? 'Sending…' : 'Send An Invite'}</button>
+          <button className='btn btn-primary' disabled={busy === 'check' || busy === 'invite' || !email} onClick={invite}>{busy === 'check' ? 'Checking…' : busy === 'invite' ? 'Sending…' : 'Check & Invite'}</button>
         </div>
+        {inviteCheck && !inviteCheck.exists && (
+          <div className='invite-confirm-box'>
+            <div><strong>{inviteCheck.email}</strong> is not on Lethem yet. Send an email invite so they can sign up and join this workspace?</div>
+            <div className='row-actions'><button className='btn btn-ghost btn-sm' onClick={resetInviteCheck}>Cancel</button><button className='btn btn-primary btn-sm' disabled={busy === 'invite'} onClick={() => sendInvite(inviteCheck.email, role)}>Send Email Invite</button></div>
+          </div>
+        )}
       </div>
       <div className='card'>
         <div className='card-header'><div><div className='card-title'>Current members</div><div className='card-sub'>{ctx.members.length} teammate{ctx.members.length === 1 ? '' : 's'} in this workspace</div></div></div>

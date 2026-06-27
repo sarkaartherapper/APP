@@ -148,6 +148,7 @@ async function ensureAuthSchema() {
       token_hash TEXT NOT NULL UNIQUE,
       invited_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       accepted_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      invited_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       accepted_at TIMESTAMPTZ,
       revoked_at TIMESTAMPTZ,
       expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
@@ -159,6 +160,7 @@ async function ensureAuthSchema() {
     CREATE INDEX IF NOT EXISTS idx_organization_invites_org ON organization_invites(organization_id);
     CREATE INDEX IF NOT EXISTS idx_organization_invites_email ON organization_invites(LOWER(email));
     CREATE INDEX IF NOT EXISTS idx_organization_invites_token_hash ON organization_invites(token_hash);
+    CREATE INDEX IF NOT EXISTS idx_organization_invites_invited_user_id ON organization_invites(invited_user_id);
   `);
 }
 

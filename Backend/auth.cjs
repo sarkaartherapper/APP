@@ -124,7 +124,7 @@ async function acceptPendingInvites(user) {
         [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
       );
       await query(
-        `UPDATE organization_invites SET accepted_at = NOW(), accepted_by_user_id = $1, updated_at = NOW() WHERE id = $2`,
+        `UPDATE organization_invites SET accepted_at = NOW(), accepted_by_user_id = $1, invited_user_id = COALESCE(invited_user_id, $1), updated_at = NOW() WHERE id = $2`,
         [user.id, invite.id],
       );
       await query('COMMIT');
