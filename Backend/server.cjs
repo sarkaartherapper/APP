@@ -7,6 +7,7 @@ const { createClient } = require('redis');
 const { query, initDb, encryptSecret, decryptSecret } = require('./db.cjs');
 const { requireAuth, requireOrgRole, loadUserOrganizations, normalizeOrgRole } = require('./auth.cjs');
 const { BILLING_PLANS, publicBillingConfig } = require('./billing.cjs');
+const { sendEmail } = require('./email.cjs');
 const { listProviders, listModels, getProvider, getProviderForModel, getDefaultModel, isModelAllowedForProvider, normalizeAllowedModels, normalizeProviderModel, normalizeUsage, estimateCostUsd, callProvider, normalizeProviderResponse } = require('./providers.cjs');
 
 const DEFAULT_RPM_LIMIT = Number(process.env.RATE_LIMIT_DEFAULT_PER_MIN || 2);
@@ -45,24 +46,15 @@ function inviteLink(token) {
   return `${publicAppUrl()}/invite/${encodeURIComponent(token)}`;
 }
 
-async function sendInviteEmail({ to, role, organizationName, inviterName, token }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    fastify.log.warn({ to }, 'RESEND_API_KEY missing; invite email not sent');
-    return { sent: false, skipped: true, reason: 'RESEND_API_KEY missing' };
-  }
+function inviteEmailContent({ role, organizationName, inviterName, token }) {
   const link = inviteLink(token);
-  const from = process.env.RESEND_FROM_EMAIL || 'Lethem <onboarding@resend.dev>';
-  const subject = `${inviterName || 'A teammate'} invited you to ${organizationName || 'Lethem'}`;
-  const html = `<div style="font-family:Inter,Arial,sans-serif;line-height:1.5;color:#111827"><h2>You're invited to Lethem</h2><p>${inviterName || 'A teammate'} invited you to join <strong>${organizationName || 'their workspace'}</strong> as <strong>${role}</strong>.</p><p><a href="${link}" style="display:inline-block;background:#7c6bff;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Accept invite</a></p><p>If the button does not work, copy this link: <br/><a href="${link}">${link}</a></p></div>`;
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, to, subject, html }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || data?.error?.message || `Resend HTTP ${res.status}`);
-  return { sent: true, id: data?.id || null };
+  const safeOrg = organizationName || 'their workspace';
+  const safeInviter = inviterName || 'A teammate';
+  return {
+    subject: `${safeInviter} invited you to ${organizationName || 'Lethem'}`,
+    html: `<div style="font-family:Inter,Arial,sans-serif;line-height:1.5;color:#111827"><h2>You're invited to Lethem</h2><p>${safeInviter} invited you to join <strong>${safeOrg}</strong> as <strong>${role}</strong>.</p><p><a href="${link}" style="display:inline-block;background:#7c6bff;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Accept invite</a></p><p>If the button does not work, copy this link:<br/><a href="${link}">${link}</a></p></div>`,
+    text: `You're invited to Lethem. ${safeInviter} invited you to join ${safeOrg} as ${role}. Accept invite: ${link}`,
+  };
 }
 
 function isEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim()); }
@@ -472,9 +464,9 @@ fastify.post('/api/invites', {
      VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '7 days')`,
     [id, auth.organization.id, email, role, hashToken(token), auth.user.id],
   );
-  let emailResult;
-  try { emailResult = await sendInviteEmail({ to: email, role, organizationName: auth.organization.name, inviterName: auth.user.name || auth.user.email, token }); }
-  catch (err) { req.log.error({ err }, 'invite email failed'); return reply.code(502).send(ERR('EMAIL_SEND_FAILED', err.message || 'failed to send invite email')); }
+  const emailContent = inviteEmailContent({ role, organizationName: auth.organization.name, inviterName: auth.user.name || auth.user.email, token });
+  const emailResult = await sendEmail({ to: email, ...emailContent });
+  if (!emailResult.sent) req.log.error({ emailResult, invited_email: email }, 'invite email failed');
   return { success: true, id, invited_email: email, role, invite_url: inviteLink(token), email_delivery: emailResult };
 });
 

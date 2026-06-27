@@ -39,7 +39,7 @@ export default function MembersPage({ ctx }) {
         <p className='page-sub'>Manage teammates on Lethem and send invites when someone is not already in your workspace.</p>
       </div>
       <div className='card invite-card'>
-        <div className='card-header'><div><div className='card-title'>Invite a teammate</div><div className='card-sub'>If the user is not on Lethem, send them an email invitation powered by Resend.</div></div></div>
+        <div className='card-header'><div><div className='card-title'>Invite a teammate</div><div className='card-sub'>If the user is not on Lethem, send them a transactional email invitation.</div></div></div>
         <div className='invite-form'>
           <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder='teammate@example.com' type='email' />
           <select value={role} onChange={(e) => setRole(e.target.value)}>{ASSIGNABLE_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}</select>
