@@ -187,7 +187,16 @@ export default function LethemProvider({ children, projectSlug, page }) {
     finally { setTeamLoading(false); }
   };
 
-  const checkInvitee = async (email) => api('/api/invites/check', { method: 'POST', body: { email } });
+  const checkInvitee = async (email) => {
+    try {
+      return await api('/api/invites/check', { method: 'POST', body: { email } });
+    } catch (err) {
+      if (String(err.message || '').toLowerCase().includes('not found')) {
+        return api(`/api/invites/check?email=${encodeURIComponent(email)}`, { noCache: true });
+      }
+      throw err;
+    }
+  };
 
   const inviteMember = async (email, role) => {
     const res = await api('/api/invites', { method: 'POST', body: { email, role } });

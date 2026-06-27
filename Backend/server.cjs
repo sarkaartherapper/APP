@@ -39,7 +39,14 @@ fastify.register(require('@fastify/helmet'), { contentSecurityPolicy: false });
 function hashToken(token) { return createHash('sha256').update(token).digest('hex'); }
 
 function publicAppUrl() {
-  return String(process.env.FRONTEND_URL || process.env.PUBLIC_APP_URL || process.env.APP_BASE_URL || 'https://lethem.vercel.app').replace(/\/+$/, '');
+  const fallback = 'https://lethem.vercel.app';
+  const raw = String(process.env.FRONTEND_URL || process.env.PUBLIC_APP_URL || process.env.APP_BASE_URL || fallback).trim();
+  const normalized = (raw || fallback).replace(/\/+$/, '');
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    if (host.includes('lethem-backend') || host.endsWith('.onrender.com')) return fallback;
+  } catch (_) { return fallback; }
+  return normalized;
 }
 
 function inviteLink(token) {
@@ -481,11 +488,9 @@ fastify.get('/api/invites', async (req, reply) => {
   });
 });
 
-fastify.post('/api/invites/check', {
-  schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } },
-}, async (req, reply) => {
+async function checkInviteeHandler(req, reply) {
   const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
-  const email = String(req.body?.email || '').trim().toLowerCase();
+  const email = String(req.body?.email || req.query?.email || '').trim().toLowerCase();
   if (!isEmail(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
   const user = await findUserByEmail(email);
   const { rows: existingMembers } = await query(
@@ -493,7 +498,16 @@ fastify.post('/api/invites/check', {
     [auth.organization.id, email],
   );
   return { email, exists: Boolean(user), already_member: Boolean(existingMembers[0]), user: user ? { id: user.id, email: user.email, name: user.name, picture_url: user.picture_url } : null };
-});
+}
+
+fastify.post('/api/invites/check', {
+  schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } },
+}, checkInviteeHandler);
+fastify.get('/api/invites/check', checkInviteeHandler);
+fastify.post('/api/invite/check', {
+  schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } },
+}, checkInviteeHandler);
+fastify.get('/api/invite/check', checkInviteeHandler);
 
 fastify.post('/api/invites', {
   schema: { body: { type: 'object', required: ['email', 'role'], properties: { email: { type: 'string' }, role: { type: 'string' } } } },
