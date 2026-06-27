@@ -5,8 +5,9 @@ const { randomUUID, createHash, createHmac } = require('crypto');
 const fastify = require('fastify')({ logger: { level: 'info' }, genReqId: () => randomUUID() });
 const { createClient } = require('redis');
 const { query, initDb, encryptSecret, decryptSecret } = require('./db.cjs');
-const { requireAuth, requireOrgRole, loadUserOrganizations } = require('./auth.cjs');
+const { requireAuth, requireOrgRole, loadUserOrganizations, normalizeOrgRole } = require('./auth.cjs');
 const { BILLING_PLANS, publicBillingConfig } = require('./billing.cjs');
+const { sendEmail } = require('./email.cjs');
 const { listProviders, listModels, getProvider, getProviderForModel, getDefaultModel, isModelAllowedForProvider, normalizeAllowedModels, normalizeProviderModel, normalizeUsage, estimateCostUsd, callProvider, normalizeProviderResponse } = require('./providers.cjs');
 
 const DEFAULT_RPM_LIMIT = Number(process.env.RATE_LIMIT_DEFAULT_PER_MIN || 2);
@@ -36,6 +37,78 @@ fastify.register(require('@fastify/cors'), {
 fastify.register(require('@fastify/helmet'), { contentSecurityPolicy: false });
 
 function hashToken(token) { return createHash('sha256').update(token).digest('hex'); }
+
+function publicAppUrl() {
+  const fallback = 'https://lethem.vercel.app';
+  const raw = String(process.env.FRONTEND_URL || process.env.PUBLIC_APP_URL || process.env.APP_BASE_URL || fallback).trim();
+  const normalized = (raw || fallback).replace(/\/+$/, '');
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    if (host.includes('lethem-backend') || host.endsWith('.onrender.com')) return fallback;
+  } catch (_) { return fallback; }
+  return normalized;
+}
+
+function inviteLink(token) {
+  return `${publicAppUrl()}/invite/${encodeURIComponent(token)}`;
+}
+
+function inviteEmailContent({ role, organizationName, inviterName, token }) {
+  const link = inviteLink(token);
+  const safeOrg = organizationName || 'their workspace';
+  const safeInviter = inviterName || 'A teammate';
+  return {
+    subject: `${safeInviter} invited you to ${organizationName || 'Lethem'}`,
+    html: `<div style="font-family:Inter,Arial,sans-serif;line-height:1.5;color:#111827"><h2>You're invited to Lethem</h2><p>${safeInviter} invited you to join <strong>${safeOrg}</strong> as <strong>${role}</strong>.</p><p><a href="${link}" style="display:inline-block;background:#7c6bff;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none">Accept invite</a></p><p>If the button does not work, copy this link:<br/><a href="${link}">${link}</a></p></div>`,
+    text: `You're invited to Lethem. ${safeInviter} invited you to join ${safeOrg} as ${role}. Accept invite: ${link}`,
+  };
+}
+
+function isEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim()); }
+
+async function findUserByEmail(email) {
+  const { rows } = await query(
+    `SELECT id, email, name, picture_url FROM users WHERE LOWER(email) = $1 ORDER BY updated_at DESC LIMIT 1`,
+    [String(email || '').trim().toLowerCase()],
+  );
+  return rows[0] || null;
+}
+
+async function acceptInviteForUser({ inviteId = null, token = null, user }) {
+  const params = [];
+  let where = '';
+  if (token) { params.push(hashToken(String(token))); where = 'oi.token_hash = $1'; }
+  else { params.push(String(inviteId || '')); where = 'oi.id = $1'; }
+  const { rows } = await query(
+    `SELECT oi.id, oi.organization_id, oi.role, oi.email, oi.invited_user_id
+     FROM organization_invites oi
+     WHERE ${where} AND oi.accepted_at IS NULL AND oi.revoked_at IS NULL AND oi.expires_at > NOW()
+     LIMIT 1`,
+    params,
+  );
+  const invite = rows[0];
+  if (!invite) return { error: 'INVITE_NOT_FOUND' };
+  const userEmail = String(user?.email || '').toLowerCase();
+  const invitedEmail = String(invite.email || '').toLowerCase();
+  const invitedUserMatches = invite.invited_user_id && String(invite.invited_user_id) === String(user.id);
+  if (!invitedUserMatches && invitedEmail !== userEmail) return { error: 'INVITE_EMAIL_MISMATCH' };
+  await query('BEGIN');
+  try {
+    await query(
+      `INSERT INTO organization_members (organization_id, user_id, role, updated_at)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+      [invite.organization_id, user.id, normalizeOrgRole(invite.role)],
+    );
+    await query(
+      `UPDATE organization_invites SET accepted_at = NOW(), accepted_by_user_id = $1, invited_user_id = COALESCE(invited_user_id, $1), updated_at = NOW() WHERE id = $2`,
+      [user.id, invite.id],
+    );
+    await query('COMMIT');
+  } catch (err) { await query('ROLLBACK').catch(() => {}); throw err; }
+  return { invite };
+}
+
 function maskKey(apiKey) { return apiKey.slice(0, 7) + '••••••••' + apiKey.slice(-4); }
 
 async function pingRedis() {
@@ -113,6 +186,10 @@ fastify.setErrorHandler(async (err, req, reply) => {
 });
 
 fastify.get('/health', async () => ({ status: 'ok', ts: Date.now(), request_id: randomUUID() }));
+
+fastify.get('/invite/:token', async (req, reply) => {
+  return reply.redirect(302, inviteLink(req.params.token));
+});
 
 fastify.get('/health/db', async (req, reply) => {
   try {
@@ -326,6 +403,150 @@ async function getProject(req, reply) {
   req.projectRole = project.organization_role;
   return project;
 }
+
+
+fastify.get('/api/members', async (req, reply) => {
+  const auth = await requireAuth(req, reply); if (!auth) return;
+  const { rows } = await query(
+    `SELECT om.user_id AS id, om.role, EXTRACT(EPOCH FROM om.created_at)::bigint AS joined_at,
+            u.email, u.name, u.picture_url
+     FROM organization_members om
+     JOIN users u ON u.id = om.user_id
+     WHERE om.organization_id = $1
+     ORDER BY CASE om.role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 WHEN 'developer' THEN 3 ELSE 4 END, om.created_at ASC`,
+    [auth.organization.id],
+  );
+  return rows.map((row) => ({ ...row, role: normalizeOrgRole(row.role), is_current_user: row.id === auth.user.id }));
+});
+
+fastify.patch('/api/members/:userId', {
+  schema: { body: { type: 'object', required: ['role'], properties: { role: { type: 'string' } } } },
+}, async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const role = normalizeOrgRole(req.body?.role);
+  if (role === 'owner') return reply.code(400).send(ERR('VALIDATION_ERROR', 'Owner transfers are not supported here.'));
+  const userId = String(req.params.userId || '');
+  if (userId === auth.user.id) return reply.code(400).send(ERR('VALIDATION_ERROR', 'You cannot change your own role.'));
+  const { rows } = await query(
+    `UPDATE organization_members SET role = $1, updated_at = NOW()
+     WHERE organization_id = $2 AND user_id = $3 AND role <> 'owner'
+     RETURNING user_id AS id, role`,
+    [role, auth.organization.id, userId],
+  );
+  if (!rows[0]) return reply.code(404).send(ERR('MEMBER_NOT_FOUND', 'member not found'));
+  return { success: true, member: rows[0] };
+});
+
+fastify.delete('/api/members/:userId', async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const userId = String(req.params.userId || '');
+  if (userId === auth.user.id) return reply.code(400).send(ERR('VALIDATION_ERROR', 'You cannot remove yourself.'));
+  const { rowCount } = await query(
+    `DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2 AND role <> 'owner'`,
+    [auth.organization.id, userId],
+  );
+  return { success: true, removed: rowCount > 0 };
+});
+
+
+fastify.post('/api/invites/accept', {
+  schema: { body: { type: 'object', properties: { token: { type: 'string' }, inviteId: { type: 'string' } } } },
+}, async (req, reply) => {
+  const auth = await requireAuth(req, reply); if (!auth) return;
+  const token = String(req.body?.token || '').trim();
+  const inviteId = String(req.body?.inviteId || '').trim();
+  if (!token && !inviteId) return reply.code(400).send(ERR('VALIDATION_ERROR', 'token or inviteId required'));
+  const result = await acceptInviteForUser({ token: token || null, inviteId: inviteId || null, user: auth.user });
+  if (result.error === 'INVITE_NOT_FOUND') return reply.code(404).send(ERR('INVITE_NOT_FOUND', 'Invite not found or expired.'));
+  if (result.error === 'INVITE_EMAIL_MISMATCH') return reply.code(403).send(ERR('INVITE_EMAIL_MISMATCH', 'Sign in with the invited email address to accept this invite.'));
+  return { success: true };
+});
+
+fastify.get('/api/invites', async (req, reply) => {
+  const auth = await requireAuth(req, reply); if (!auth) return;
+  const { rows } = await query(
+    `SELECT oi.id, oi.organization_id, o.name AS organization_name, oi.email, oi.role,
+            oi.invited_user_id, oi.accepted_by_user_id,
+            oi.accepted_at IS NOT NULL AS accepted, oi.revoked_at IS NOT NULL AS revoked,
+            EXTRACT(EPOCH FROM oi.created_at)::bigint AS created_at,
+            EXTRACT(EPOCH FROM oi.expires_at)::bigint AS expires_at,
+            EXTRACT(EPOCH FROM oi.accepted_at)::bigint AS accepted_at,
+            inviter.name AS invited_by_name, inviter.email AS invited_by_email,
+            invited.name AS invited_user_name, invited.email AS invited_user_email
+     FROM organization_invites oi
+     JOIN organizations o ON o.id = oi.organization_id
+     LEFT JOIN users inviter ON inviter.id = oi.invited_by_user_id
+     LEFT JOIN users invited ON invited.id = oi.invited_user_id
+     WHERE oi.organization_id = $1 OR oi.invited_user_id = $2 OR LOWER(oi.email) = LOWER($3)
+     ORDER BY oi.created_at DESC`,
+    [auth.organization.id, auth.user.id, auth.user.email || ''],
+  );
+  return rows.map((row) => {
+    const now = Math.floor(Date.now()/1000);
+    const direction = row.organization_id === auth.organization.id ? 'sent' : 'received';
+    return { ...row, role: normalizeOrgRole(row.role), direction, can_accept: direction === 'received' && !row.accepted && !row.revoked && (!row.expires_at || row.expires_at > now), status: row.accepted ? 'accepted' : row.revoked ? 'revoked' : (row.expires_at && row.expires_at < now) ? 'expired' : 'pending' };
+  });
+});
+
+async function checkInviteeHandler(req, reply) {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const email = String(req.body?.email || req.query?.email || '').trim().toLowerCase();
+  if (!isEmail(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
+  const user = await findUserByEmail(email);
+  const { rows: existingMembers } = await query(
+    `SELECT 1 FROM organization_members om JOIN users u ON u.id = om.user_id WHERE om.organization_id = $1 AND LOWER(u.email) = $2 LIMIT 1`,
+    [auth.organization.id, email],
+  );
+  return { email, exists: Boolean(user), already_member: Boolean(existingMembers[0]), user: user ? { id: user.id, email: user.email, name: user.name, picture_url: user.picture_url } : null };
+}
+
+fastify.post('/api/invites/check', {
+  schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } },
+}, checkInviteeHandler);
+fastify.get('/api/invites/check', checkInviteeHandler);
+fastify.post('/api/invite/check', {
+  schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string' } } } },
+}, checkInviteeHandler);
+fastify.get('/api/invite/check', checkInviteeHandler);
+
+fastify.post('/api/invites', {
+  schema: { body: { type: 'object', required: ['email', 'role'], properties: { email: { type: 'string' }, role: { type: 'string' } } } },
+}, async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const role = normalizeOrgRole(req.body?.role);
+  if (!isEmail(email)) return reply.code(400).send(ERR('VALIDATION_ERROR', 'valid email required'));
+  if (role === 'owner') return reply.code(400).send(ERR('VALIDATION_ERROR', 'Invite admin, developer, or viewer roles.'));
+  const invitedUser = await findUserByEmail(email);
+  const { rows: existingMembers } = await query(
+    `SELECT 1 FROM organization_members om JOIN users u ON u.id = om.user_id WHERE om.organization_id = $1 AND LOWER(u.email) = $2 LIMIT 1`,
+    [auth.organization.id, email],
+  );
+  if (existingMembers[0]) return reply.code(409).send(ERR('ALREADY_MEMBER', 'This user is already in this workspace.'));
+  const token = randomUUID() + randomUUID().replace(/-/g, '');
+  const id = randomUUID();
+  await query(
+    `INSERT INTO organization_invites (id, organization_id, email, role, token_hash, invited_by_user_id, invited_user_id, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,NOW() + INTERVAL '7 days')`,
+    [id, auth.organization.id, email, role, hashToken(token), auth.user.id, invitedUser?.id || null],
+  );
+  let emailResult = { sent: false, skipped: true, reason: 'Existing Lethem user gets an in-app invite' };
+  if (!invitedUser) {
+    const emailContent = inviteEmailContent({ role, organizationName: auth.organization.name, inviterName: auth.user.name || auth.user.email, token });
+    emailResult = await sendEmail({ to: email, ...emailContent });
+    if (!emailResult.sent) req.log.error({ emailResult, invited_email: email }, 'invite email failed');
+  }
+  return { success: true, id, invited_email: email, invited_user: invitedUser ? { id: invitedUser.id, email: invitedUser.email, name: invitedUser.name, picture_url: invitedUser.picture_url } : null, user_exists: Boolean(invitedUser), role, invite_url: inviteLink(token), email_delivery: emailResult };
+});
+
+fastify.delete('/api/invites/:id', async (req, reply) => {
+  const auth = await requireOrgRole(req, reply, ['owner', 'admin']); if (!auth) return;
+  const { rowCount } = await query(
+    `UPDATE organization_invites SET revoked_at = NOW(), updated_at = NOW() WHERE id = $1 AND organization_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL`,
+    [req.params.id, auth.organization.id],
+  );
+  return { success: true, revoked: rowCount > 0 };
+});
 
 fastify.get('/api/projects', async (req, reply) => {
   const auth = await requireAuth(req, reply); if (!auth) return;
@@ -753,11 +974,13 @@ async function start() {
       EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organization_members') AS organization_members_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='organization_id') AS project_org_ok,
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='organizations' AND column_name='plan') AS org_plan_ok,
-      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='billing_events') AS billing_events_ok
+      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='billing_events') AS billing_events_ok,
+      EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='organization_invites') AS organization_invites_ok,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='organization_invites' AND column_name='invited_user_id') AS organization_invites_user_ok
   `);
   const c = schemaChecks[0] || {};
-  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok)) {
-    throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql');
+  if (!(c.projects_ok && c.subkeys_token_cipher_ok && c.subkeys_token_iv_ok && c.subkeys_token_tag_ok && c.health_ok && c.error_logs_ok && c.request_log_request_id_ok && c.request_log_provider_ok && c.request_log_error_reason_ok && c.request_log_cost_ok && c.users_ok && c.organizations_ok && c.organization_members_ok && c.project_org_ok && c.org_plan_ok && c.billing_events_ok && c.organization_invites_ok && c.organization_invites_user_ok)) {
+    throw new Error('Schema drift detected. Apply migrations in order: 001_initial_postgres.sql, 002_health_monitoring.sql, 003_request_error_logs.sql, 004_request_log_details.sql, 005_auth_organizations.sql, 006_billing_subscriptions.sql, 007_members_invites.sql, 008_invited_user_relation.sql');
   }
 
   const writeDailyHealth = async () => {

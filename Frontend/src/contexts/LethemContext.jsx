@@ -34,6 +34,9 @@ export default function LethemProvider({ children, projectSlug, page }) {
   const [loading, setLoading] = useState({ overview: true, masterkeys: true, subkeys: true, logs: true });
   const [copiedItem, setCopiedItem] = useState('');
   const [billing, setBilling] = useState(null);
+  const [members, setMembers] = useState([]);
+  const [invites, setInvites] = useState([]);
+  const [teamLoading, setTeamLoading] = useState(false);
 
   const notify = (msg, type = 'success') => { setNotif({ show: true, msg, type }); setTimeout(() => setNotif((v) => ({ ...v, show: false })), 3000); };
 
@@ -98,8 +101,22 @@ export default function LethemProvider({ children, projectSlug, page }) {
     return res.providers || [];
   };
 
+  const acceptPendingInviteToken = async () => {
+    let token = '';
+    try { token = sessionStorage.getItem('lethem_pending_invite_token') || ''; } catch (_) {}
+    if (!token) return null;
+    try {
+      const res = await api('/api/invites/accept', { method: 'POST', body: { token } });
+      notify('Invite accepted');
+      return res;
+    } finally {
+      try { sessionStorage.removeItem('lethem_pending_invite_token'); } catch (_) {}
+    }
+  };
+
   const loadProjects = async () => {
-    const rows = await api('/api/projects');
+    await acceptPendingInviteToken().catch((e) => notify(e.message, 'error'));
+    const rows = await api('/api/projects', { noCache: true });
     setProjects(rows);
     return rows;
   };
@@ -158,6 +175,64 @@ export default function LethemProvider({ children, projectSlug, page }) {
     }
   };
 
+  const loadMembers = async () => {
+    setTeamLoading(true);
+    try { const rows = await api('/api/members', { noCache: true }); setMembers(rows); return rows; }
+    finally { setTeamLoading(false); }
+  };
+
+  const loadInvites = async () => {
+    setTeamLoading(true);
+    try { const rows = await api('/api/invites', { noCache: true }); setInvites(rows); return rows; }
+    finally { setTeamLoading(false); }
+  };
+
+  const checkInvitee = async (email) => {
+    try {
+      return await api('/api/invites/check', { method: 'POST', body: { email } });
+    } catch (err) {
+      if (String(err.message || '').toLowerCase().includes('not found')) {
+        return api(`/api/invites/check?email=${encodeURIComponent(email)}`, { noCache: true });
+      }
+      throw err;
+    }
+  };
+
+  const inviteMember = async (email, role) => {
+    const res = await api('/api/invites', { method: 'POST', body: { email, role } });
+    notify(res.user_exists ? 'In-app invite sent' : 'Email invite sent');
+    await Promise.all([loadMembers().catch(() => []), loadInvites().catch(() => [])]);
+    return res;
+  };
+
+  const acceptInvite = async (inviteId) => {
+    const res = await api('/api/invites/accept', { method: 'POST', body: { inviteId } });
+    notify('Invite accepted');
+    await Promise.all([loadProjects().catch(() => []), loadInvites().catch(() => [])]);
+    return res;
+  };
+
+  const updateMemberRole = async (userId, role) => {
+    const res = await api(`/api/members/${encodeURIComponent(userId)}`, { method: 'PATCH', body: { role } });
+    notify('Member role updated');
+    await loadMembers();
+    return res;
+  };
+
+  const removeMember = async (userId) => {
+    const res = await api(`/api/members/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+    notify('Member removed');
+    await loadMembers();
+    return res;
+  };
+
+  const revokeInvite = async (inviteId) => {
+    const res = await api(`/api/invites/${encodeURIComponent(inviteId)}`, { method: 'DELETE' });
+    notify('Invite revoked');
+    await loadInvites();
+    return res;
+  };
+
   const createProject = async (name) => {
     const projectLimit = billing?.plans?.find((plan) => plan.id === billing.currentPlan)?.limits?.projects ?? 3;
     if (projectLimit !== null && projects.length >= projectLimit) { notify(`Maximum ${projectLimit} projects allowed on your current plan`, 'error'); return null; }
@@ -196,6 +271,8 @@ export default function LethemProvider({ children, projectSlug, page }) {
     if (page === 'masterkeys') loadMasterKeys().catch((e) => notify(e.message, 'error'));
     if (page === 'subkeys') loadSubkeys().catch((e) => notify(e.message, 'error'));
     if (page === 'logs') loadLogs().catch((e) => notify(e.message, 'error'));
+    if (page === 'members') loadMembers().catch((e) => notify(e.message, 'error'));
+    if (page === 'invites') loadInvites().catch((e) => notify(e.message, 'error'));
     if (page === 'demo' || page === 'notifications') {
       loadSubkeys().catch((e) => notify(e.message, 'error'));
       setLoading((v) => ({ ...v, subkeys: true }));
@@ -204,6 +281,8 @@ export default function LethemProvider({ children, projectSlug, page }) {
 
   // Reset subkey loading when data arrives for demo/notifications
   useEffect(() => {
+    if (page === 'members') loadMembers().catch((e) => notify(e.message, 'error'));
+    if (page === 'invites') loadInvites().catch((e) => notify(e.message, 'error'));
     if (page === 'demo' || page === 'notifications') {
       if (subkeys.length > 0) setLoading((v) => ({ ...v, subkeys: false }));
     }
@@ -227,10 +306,11 @@ export default function LethemProvider({ children, projectSlug, page }) {
   const ctx = useMemo(() => ({
     API, providers, loadProviders, fmtNum, fmtTime, fmtDate, quotaColor, sleep,
     api, notify, copyText, modal, setModal, revealedToken, setRevealedToken,
-    loadMasterKeys, loadSubkeys, loadLogs, loadOverview, loadBilling,
-    subkeys, setSubkeys, masterKeys, logs, analytics, billing, setBilling, page, loading, copiedItem,
+    loadMasterKeys, loadSubkeys, loadLogs, loadOverview, loadBilling, loadMembers, loadInvites,
+    checkInvitee, inviteMember, acceptInvite, updateMemberRole, removeMember, revokeInvite,
+    subkeys, setSubkeys, masterKeys, logs, analytics, billing, setBilling, members, invites, teamLoading, page, loading, copiedItem,
     selectedProject: projects.find((p) => p.slug === projectSlug || p.id === projectSlug),
-  }), [modal, subkeys, masterKeys, logs, analytics, billing, revealedToken, page, projectSlug, providers, loading, copiedItem, isAuthenticated, user?.sub, projects]);
+  }), [modal, subkeys, masterKeys, logs, analytics, billing, members, invites, teamLoading, revealedToken, page, projectSlug, providers, loading, copiedItem, isAuthenticated, user?.sub, projects]);
 
   const value = useMemo(() => ({
     ctx,
@@ -239,7 +319,7 @@ export default function LethemProvider({ children, projectSlug, page }) {
     deleteConfirm, setDeleteConfirm, showPlanBanner, setShowPlanBanner,
     mobileMenuOpen, setMobileMenuOpen,
     notif,
-    createProject, deleteProject, loadProviders, loadProjects, loadBilling, notify,
+    createProject, deleteProject, loadProviders, loadProjects, loadBilling, notify, acceptPendingInviteToken,
     filteredProjects: projects.filter((p) =>
       `${p.name} ${p.slug} ${p.id}`.toLowerCase().includes(projectSearch.toLowerCase())
     ),
